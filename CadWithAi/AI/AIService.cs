@@ -1,50 +1,127 @@
-﻿using CadWithAi.Services;
 using Microsoft.Extensions.AI;
+using System.Text.Json;
 
-namespace CadWithAi.AI
+namespace CadWithAi.AI;
+
+public sealed class AIService
 {
-    public class AIService
+    private const string OllamaUrl = "http://localhost:11434";
+    private const string ModelName = "qwen3:4b";
+
+    private readonly IChatClient _chatClient;
+    private readonly ToolRegistry _toolRegistry;
+
+    public AIService(ToolRegistry toolRegistry)
     {
-        private readonly IChatClient _chatClient;
-        private readonly ChatOptions _chatOptions;
+        _toolRegistry = toolRegistry;
 
-        public AIService(IBaseCadOperationService baseCadOperationService)
+        IChatClient baseClient = new OllamaChatClient(
+            new Uri(OllamaUrl),
+            ModelName);
+
+        _chatClient = baseClient
+            .AsBuilder()
+            .UseFunctionInvocation()
+            .Build();
+    }
+
+    public IReadOnlyList<ToolServiceDescriptor> Services => _toolRegistry.Services;
+
+    public async Task<string> ProcessUserRequestAsync(
+        string userMessage,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(userMessage))
+            return "Please enter a request.";
+
+        ToolServiceDescriptor? service = await SelectServiceAsync(userMessage, cancellationToken);
+
+        if (service is null)
+            return "I could not determine which CAD operation service should handle that request.";
+
+        ChatOptions options = new()
         {
-            // Connect to local Ollama instance running qwen3:14b
-            IChatClient baseClient = new OllamaChatClient(new Uri("http://localhost:11434"), "qwen3:14b");
+            Tools = service.Tools.Select(x => (AITool)x.Function).ToList(),
+            Temperature = 0,
+            MaxOutputTokens = 128,
+            AllowMultipleToolCalls = false,
+            Instructions =
+                "You are the operation executor for the selected CAD service. " +
+                "Choose the single best tool for the user's request and invoke it immediately. " +
+                "Do not explain your reasoning. If the request cannot be completed by an available tool, say so briefly."
+        };
 
-            // Build automatic tool invocation pipeline
-            _chatClient = baseClient
-                .AsBuilder()
-                .UseFunctionInvocation()
-                .Build();
+        ChatResponse response = await _chatClient.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, userMessage)],
+            options,
+            cancellationToken);
 
-            // Register your interface methods as tools
-            var tools = new List<AITool>
-            {
-                AIFunctionFactory.Create(baseCadOperationService.LoadObjAsync),
-                AIFunctionFactory.Create(baseCadOperationService.GetLoadedModelAsync),
-                AIFunctionFactory.Create(baseCadOperationService.RotateObjAsync),
-                AIFunctionFactory.Create(baseCadOperationService.SetCameraAngleAsync),
-            };
+        return response.Text;
+    }
 
-            _chatOptions = new ChatOptions
-            {
-                Tools = tools,
-                Instructions = "You are an order processing assistant. " +
-                               "Select and execute the appropriate tool function based on user intent."
-            };
-        }
+    private async Task<ToolServiceDescriptor?> SelectServiceAsync(
+        string userMessage,
+        CancellationToken cancellationToken)
+    {
+        string catalog = string.Join(
+            "\n",
+            _toolRegistry.Services.Select(x => $"- {x.Name}: {x.Description}"));
 
-        public async Task<string> ProcessUserRequestAsync(string userMessage)
+        string prompt = $"""
+            Select the single service that best matches the user's request.
+
+            Available services:
+            {catalog}
+
+            User request:
+            {userMessage}
+
+            Return ONLY valid JSON in this exact format:
+            {{"service":"ServiceName"}}
+            """;
+
+        ChatOptions options = new()
         {
-            var messages = new List<ChatMessage>
-            {
-                new(ChatRole.User, userMessage)
-            };
+            Temperature = 0,
+            MaxOutputTokens = 32,
+            Instructions = "You are a fast service router. Return only the requested JSON. Do not explain your reasoning."
+        };
 
-            ChatResponse response = await _chatClient.GetResponseAsync(messages, _chatOptions);
-            return response.Text;
+        ChatResponse response = await _chatClient.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, prompt)],
+            options,
+            cancellationToken);
+
+        string json = ExtractJsonObject(response.Text);
+
+        try
+        {
+            ServiceSelection? selection = JsonSerializer.Deserialize<ServiceSelection>(
+                json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            return selection?.Service is null
+                ? null
+                : _toolRegistry.FindService(selection.Service);
         }
+        catch (JsonException)
+        {
+            return _toolRegistry.FindService(response.Text.Trim());
+        }
+    }
+
+    private static string ExtractJsonObject(string text)
+    {
+        int start = text.IndexOf('{');
+        int end = text.LastIndexOf('}');
+
+        return start >= 0 && end > start
+            ? text[start..(end + 1)]
+            : text.Trim();
+    }
+
+    private sealed class ServiceSelection
+    {
+        public string? Service { get; set; }
     }
 }

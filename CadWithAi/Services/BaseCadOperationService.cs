@@ -1,143 +1,211 @@
-﻿using CadWithAi.Models;
+using CadWithAi.Models;
 using HelixToolkit.Wpf;
-using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.IO;
-using System.Text;
 using System.Windows.Media.Media3D;
 
-namespace CadWithAi.Services
+namespace CadWithAi.Services;
+
+public class BaseCadOperationService : IBaseCadOperationService
 {
-    public class BaseCadOperationService : IBaseCadOperationService
+    public HelixViewport3D? Hvp { get; set; }
+
+    public Task<ModelVisual3D?> GetLoadedModelAsync()
     {
-        public HelixViewport3D Hvp { get; set; }
+        if (Hvp is null)
+            return Task.FromResult<ModelVisual3D?>(null);
 
-        public Task<ModelVisual3D> GetLoadedModelAsync()
+        ModelVisual3D? model = Hvp.Children.OfType<ModelVisual3D>().FirstOrDefault();
+        return Task.FromResult(model);
+    }
+
+    public Task<bool> IsModelLoadedAsync()
+    {
+        return Task.FromResult(Hvp?.Children.OfType<ModelVisual3D>().Any() == true);
+    }
+
+    public Task<string> LoadObjAsync(string objFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(objFilePath))
+            return Task.FromResult("Error: OBJ file path is empty.");
+
+        if (!File.Exists(objFilePath))
+            return Task.FromResult($"Error: OBJ file '{objFilePath}' does not exist.");
+
+        if (Hvp is null)
+            return Task.FromResult("Error: HelixViewport3D is not initialized.");
+
+        try
         {
-            ModelVisual3D modelVisual3D = null;
-            if (this.Hvp != null)
+            ObjReader objReader = new();
+            Model3DGroup model3DGroup = objReader.Read(objFilePath);
+
+            if (model3DGroup is null)
+                return Task.FromResult("Error: The OBJ file did not contain a readable 3D model.");
+
+            ModelVisual3D modelVisual3D = new()
             {
-                modelVisual3D = this.Hvp.Children.Where(x => x is ModelVisual3D).FirstOrDefault() as ModelVisual3D;
-            }
-            return Task.FromResult(modelVisual3D);
+                Content = model3DGroup,
+                Transform = CreateTransform3DGroup()
+            };
+
+            Hvp.Children.Clear();
+            Hvp.Children.Add(new SunLight());
+            Hvp.Children.Add(modelVisual3D);
+            Hvp.ZoomExtents();
+
+            return Task.FromResult("OBJ model loaded successfully.");
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult($"Error loading OBJ model: {ex.Message}");
+        }
+    }
+
+    public async Task<string> RotateObjAsync(Axis axis, double angle)
+    {
+        if (Hvp is null)
+            return "Error: HelixViewport3D is not initialized.";
+
+        if (!await IsModelLoadedAsync())
+            return "Error: No 3D model is currently loaded.";
+
+        ApplyRotationToViewport(axis, angle);
+        return $"Model rotated {angle:0.##} degrees around the {axis} axis.";
+    }
+
+    public Task<string> SetCameraAngleAsync(string direction, int rotationAngle)
+    {
+        if (Hvp is null)
+            return Task.FromResult("Error: HelixViewport3D is not initialized.");
+
+        if (!Enum.TryParse(direction, true, out CameraDirection cameraDirection))
+            return Task.FromResult("Error: Camera direction must be Front, Back, Left, Right, Top, or Bottom.");
+
+        if (rotationAngle is not (0 or 90 or 180 or 270))
+            return Task.FromResult("Error: Camera rotation must be 0, 90, 180, or 270 degrees.");
+
+        if (!Hvp.Children.OfType<ModelVisual3D>().Any())
+            return Task.FromResult("Error: No 3D model is currently loaded.");
+
+        Vector3D lookDirection;
+        Vector3D upDirection;
+
+        switch (cameraDirection)
+        {
+            case CameraDirection.Front:
+                lookDirection = new Vector3D(0, 0, -1);
+                upDirection = new Vector3D(0, 1, 0);
+                break;
+            case CameraDirection.Back:
+                lookDirection = new Vector3D(0, 0, 1);
+                upDirection = new Vector3D(0, 1, 0);
+                break;
+            case CameraDirection.Left:
+                lookDirection = new Vector3D(1, 0, 0);
+                upDirection = new Vector3D(0, 1, 0);
+                break;
+            case CameraDirection.Right:
+                lookDirection = new Vector3D(-1, 0, 0);
+                upDirection = new Vector3D(0, 1, 0);
+                break;
+            case CameraDirection.Top:
+                lookDirection = new Vector3D(0, -1, 0);
+                upDirection = new Vector3D(0, 0, -1);
+                break;
+            case CameraDirection.Bottom:
+                lookDirection = new Vector3D(0, 1, 0);
+                upDirection = new Vector3D(0, 0, 1);
+                break;
+            default:
+                return Task.FromResult("Error: Unsupported camera direction.");
         }
 
-        public Task<string> LoadObjAsync([Description("File path of the OBJ file to load")] string objFilePath)
+        if (rotationAngle != 0)
         {
-            if (string.IsNullOrWhiteSpace(objFilePath))
-                return Task.FromResult("Error: OBJ file path is null or empty.");
-            if (!File.Exists(objFilePath))
-                return Task.FromResult($"Error: File '{objFilePath}' does not exist.");
-            try
+            Quaternion rotation = new(lookDirection, rotationAngle);
+            Matrix3D matrix = Matrix3D.Identity;
+            matrix.Rotate(rotation);
+            upDirection = matrix.Transform(upDirection);
+        }
+
+        Rect3D bounds = Hvp.Children
+            .OfType<ModelVisual3D>()
+            .Select(x => x.Content?.Bounds ?? Rect3D.Empty)
+            .Where(x => !x.IsEmpty)
+            .Aggregate(Rect3D.Empty, UnionBounds);
+
+        Point3D target = bounds.IsEmpty
+            ? new Point3D()
+            : bounds.Location + new Vector3D(bounds.SizeX / 2, bounds.SizeY / 2, bounds.SizeZ / 2);
+
+        double distance = Math.Max(Math.Max(bounds.SizeX, bounds.SizeY), Math.Max(bounds.SizeZ, 1)) * 2.5;
+        Point3D position = target - lookDirection * distance;
+
+        Hvp.SetView(position, lookDirection, upDirection, 0);
+        return Task.FromResult($"Camera set to {cameraDirection} view with {rotationAngle} degree rotation.");
+    }
+
+    private static Rect3D UnionBounds(Rect3D first, Rect3D second)
+    {
+        if (first.IsEmpty) return second;
+        if (second.IsEmpty) return first;
+        first.Union(second);
+        return first;
+    }
+
+    private void ApplyRotationToViewport(Axis axis, double angle)
+    {
+        Vector3D axisVector = axis switch
+        {
+            Axis.X => new Vector3D(1, 0, 0),
+            Axis.Y => new Vector3D(0, 1, 0),
+            Axis.Z => new Vector3D(0, 0, 1),
+            _ => throw new ArgumentOutOfRangeException(nameof(axis))
+        };
+
+        RotateTransform3D rotation = new(new AxisAngleRotation3D(axisVector, angle));
+
+        foreach (ModelVisual3D model in Hvp!.Children.OfType<ModelVisual3D>())
+        {
+            if (model.Transform is Transform3DGroup group)
             {
-                Model3DGroup model3DGroup = new Model3DGroup();
-
-                ObjReader objReader = new ObjReader();
-                var model = objReader.Read(objFilePath);
-                if (model != null) model3DGroup = model;
-                objReader = null;
-
-                ModelVisual3D modelVisual3D = new ModelVisual3D() { Content = model3DGroup };
-                modelVisual3D.Transform = CreateTransform3DGroup();
-
-                if (this.Hvp != null)
-                {
-                    this.Hvp.Children.Clear();
-                    this.Hvp.Children.Add(new SunLight());
-                    this.Hvp.Children.Add(modelVisual3D);
-                    this.Hvp.ZoomExtents();
-                }
+                if (group.Children.Count > 1)
+                    group.Children[1] = rotation;
                 else
-                {
-                    return Task.FromResult("Error: HelixViewport3D (Hvp) is not initialized.");
-                }
-            }
-            catch (Exception ex)
-            {
-                return Task.FromResult($"Error loading OBJ file: {ex.Message}");
-            }
-            return Task.FromResult("OBJ file loaded successfully.");
-        }
-
-        public async Task<string> RotateObjAsync([Description("The axis to rotate around")] Axis axis, [Description("The angle in degrees to rotate the model")] double angle)
-        {
-            if (this.Hvp != null)
-            {
-                await this.ApplyRotationToViewport(axis, angle);
-                return $"Model rotated {angle} degrees around {axis} axis.";
+                    group.Children.Add(rotation);
             }
             else
             {
-                return "Error: HelixViewport3D (Hvp) is not initialized.";
+                model.Transform = rotation;
             }
         }
+    }
 
-        public Task<string> SetCameraAngleAsync([Description("The standard camera view. Supported values: Front, Back, Left, Right, Top, Bottom (case-insensitive).")] string direction, [Description("Clockwise rotation of the selected view. Supported values: 0, 90, 180, or 270 degrees.")] int rotationAngle)
-        {
-            throw new NotImplementedException();
-        }
+    private static Transform3DGroup CreateTransform3DGroup(
+        double ttx = 0, double tty = 0, double ttz = 0,
+        double stx = 1, double sty = 1, double stz = 1,
+        double rtx = 0, double rty = 0, double rtz = 0)
+    {
+        Transform3DGroup group = new();
+        group.Children.Add(new ScaleTransform3D(stx, sty, stz));
 
+        Quaternion qX = new(new Vector3D(1, 0, 0), rtx);
+        Quaternion qY = new(new Vector3D(0, 1, 0), rty);
+        Quaternion qZ = new(new Vector3D(0, 0, 1), rtz);
+        Quaternion combined = qZ * qY * qX;
+        combined.Normalize();
 
-        private async Task ApplyRotationToViewport(Axis axis, double angle)
-        {
-            Rotation3D rotation3D = new AxisAngleRotation3D(new Vector3D(axis == Axis.X ? 1 : 0, axis == Axis.Y ? 1 : 0, axis == Axis.Z ? 1 : 0), angle);
-            RotateTransform3D rotateTransform3D = new RotateTransform3D(rotation3D);
+        group.Children.Add(new RotateTransform3D(new QuaternionRotation3D(combined)));
+        group.Children.Add(new TranslateTransform3D(ttx, tty, ttz));
+        return group;
+    }
 
-            foreach (var mv in this.Hvp.Children.OfType<ModelVisual3D>())
-            {
-                if (mv.Transform is Transform3DGroup g)
-                {
-                    if (g.Children.Count > 1)
-                        g.Children[1] = rotateTransform3D;
-                    else
-                        g.Children.Add(rotateTransform3D);
-                }
-            }
-        }
-
-        private Transform3DGroup CreateTransform3DGroup(
-             Double ttx = 0, Double tty = 0, Double ttz = 0,
-             Double stx = 1, Double sty = 1, Double stz = 1,
-             Double rtx = 0, Double rty = 0, Double rtz = 0
-         )
-        {
-            Transform3DGroup transform3DGroup = new Transform3DGroup();
-
-            ScaleTransform3D scaleTransform3D = new ScaleTransform3D() { ScaleX = stx, ScaleY = sty, ScaleZ = stz };
-
-            RotateTransform3D rotateTransform3D = new RotateTransform3D();
-            QuaternionRotation3D quaternionRotation3D = new QuaternionRotation3D();
-            rotateTransform3D.Rotation = quaternionRotation3D;
-            quaternionRotation3D.Quaternion = GetQuaternionFromEulerAngles(rtx, rty, rtz);
-            TranslateTransform3D translateTransform3D = new TranslateTransform3D() { OffsetX = ttx, OffsetY = tty, OffsetZ = ttz };
-
-            transform3DGroup.Children.Add(scaleTransform3D);
-            transform3DGroup.Children.Add(rotateTransform3D);
-            transform3DGroup.Children.Add(translateTransform3D);
-
-            return transform3DGroup;
-        }
-
-        private Quaternion GetQuaternionFromEulerAngles(double angleX, double angleY, double angleZ)
-        {
-            // Convert degrees to radians
-            double radX = Math.PI * angleX / 180.0;
-            double radY = Math.PI * angleY / 180.0;
-            double radZ = Math.PI * angleZ / 180.0;
-
-            // Create quaternions for each axis rotation
-            Quaternion qX = new Quaternion(new Vector3D(1, 0, 0), angleX);
-            Quaternion qY = new Quaternion(new Vector3D(0, 1, 0), angleY);
-            Quaternion qZ = new Quaternion(new Vector3D(0, 0, 1), angleZ);
-
-            // Combine the rotations (order matters here)
-            Quaternion combined = qZ * qY * qX;
-            combined.Normalize(); // Normalize to avoid rounding errors
-
-            return combined;
-        }
-
-
+    private enum CameraDirection
+    {
+        Front,
+        Back,
+        Left,
+        Right,
+        Top,
+        Bottom
     }
 }
