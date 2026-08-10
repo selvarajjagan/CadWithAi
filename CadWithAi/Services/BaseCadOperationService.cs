@@ -13,19 +13,13 @@ public class BaseCadOperationService : IBaseCadOperationService
         if (Hvp is null)
             return Task.FromResult<ModelVisual3D?>(null);
 
-        ModelVisual3D? model = Hvp.Children
-            .OfType<ModelVisual3D>()
-            .FirstOrDefault();
-
+        ModelVisual3D? model = Hvp.Children.OfType<ModelVisual3D>().FirstOrDefault();
         return Task.FromResult(model);
     }
 
     public Task<bool> IsModelLoadedAsync()
     {
-        if (Hvp is null)
-            return Task.FromResult(false);
-
-        return Task.FromResult(Hvp.Children.OfType<ModelVisual3D>().Any());
+        return Task.FromResult(Hvp?.Children.OfType<ModelVisual3D>().Any() == true);
     }
 
     public Task<string> LoadObjAsync(string objFilePath)
@@ -92,7 +86,6 @@ public class BaseCadOperationService : IBaseCadOperationService
         if (!Hvp.Children.OfType<ModelVisual3D>().Any())
             return Task.FromResult("Error: No 3D model is currently loaded.");
 
-        // CameraController is the supported HelixToolkit WPF camera manipulation API.
         Vector3D lookDirection;
         Vector3D upDirection;
 
@@ -115,12 +108,12 @@ public class BaseCadOperationService : IBaseCadOperationService
                 upDirection = new Vector3D(0, 1, 0);
                 break;
             case CameraDirection.Top:
-                lookDirection = new Vector3D(0, 0, -1);
-                upDirection = new Vector3D(0, 1, 0);
+                lookDirection = new Vector3D(0, -1, 0);
+                upDirection = new Vector3D(0, 0, -1);
                 break;
             case CameraDirection.Bottom:
-                lookDirection = new Vector3D(0, 0, 1);
-                upDirection = new Vector3D(0, -1, 0);
+                lookDirection = new Vector3D(0, 1, 0);
+                upDirection = new Vector3D(0, 0, 1);
                 break;
             default:
                 return Task.FromResult("Error: Unsupported camera direction.");
@@ -128,7 +121,6 @@ public class BaseCadOperationService : IBaseCadOperationService
 
         if (rotationAngle != 0)
         {
-            double radians = rotationAngle * Math.PI / 180.0;
             Quaternion rotation = new(lookDirection, rotationAngle);
             Matrix3D matrix = Matrix3D.Identity;
             matrix.Rotate(rotation);
@@ -141,12 +133,14 @@ public class BaseCadOperationService : IBaseCadOperationService
             .Where(x => !x.IsEmpty)
             .Aggregate(Rect3D.Empty, UnionBounds);
 
-        Point3D target = bounds.IsEmpty ? new Point3D() : bounds.Location + new Vector3D(bounds.SizeX / 2, bounds.SizeY / 2, bounds.SizeZ / 2);
+        Point3D target = bounds.IsEmpty
+            ? new Point3D()
+            : bounds.Location + new Vector3D(bounds.SizeX / 2, bounds.SizeY / 2, bounds.SizeZ / 2);
+
         double distance = Math.Max(Math.Max(bounds.SizeX, bounds.SizeY), Math.Max(bounds.SizeZ, 1)) * 2.5;
-
         Point3D position = target - lookDirection * distance;
-        Hvp.CameraController?.LookAt(position, target, upDirection, 0);
 
+        Hvp.SetView(position, lookDirection, upDirection, 0);
         return Task.FromResult($"Camera set to {cameraDirection} view with {rotationAngle} degree rotation.");
     }
 
@@ -192,7 +186,6 @@ public class BaseCadOperationService : IBaseCadOperationService
         double rtx = 0, double rty = 0, double rtz = 0)
     {
         Transform3DGroup group = new();
-
         group.Children.Add(new ScaleTransform3D(stx, sty, stz));
 
         Quaternion qX = new(new Vector3D(1, 0, 0), rtx);
@@ -203,7 +196,6 @@ public class BaseCadOperationService : IBaseCadOperationService
 
         group.Children.Add(new RotateTransform3D(new QuaternionRotation3D(combined)));
         group.Children.Add(new TranslateTransform3D(ttx, tty, ttz));
-
         return group;
     }
 
